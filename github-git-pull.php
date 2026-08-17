@@ -12,11 +12,11 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'GGP_VERSION',      '2.0.0' );
+define( 'GGP_VERSION',      '3.0.0' );
 define( 'GGP_PLUGIN_URL',   plugin_dir_url( __FILE__ ) );
 define( 'GGP_OPTIONS_KEY',  'ggp_settings' );
 define( 'GGP_LOG_KEY',      'ggp_pull_log' );
-define( 'GGP_DEFAULT_PATH', '/opt/bitnami/wordpress' );
+define( 'GGP_DEFAULT_PATH', '/var/www/html' );
 
 /* ---------------------------------------------------------------
  * Helpers
@@ -55,9 +55,25 @@ function ggp_git( string $args, string $repo_path = '' ): array {
         : '';
     $ep  = escapeshellarg( $repo_path );
     $cmd = "{$path_env}{$ssh_env}git -C {$ep} -c safe.directory={$ep} {$args} 2>&1";
+
+    // A prior request that got killed mid-command (PHP timeout, worker
+    // recycle, etc.) can leave this behind, which then blocks every
+    // subsequent git command. Only clear it once it's clearly stale, so a
+    // genuinely concurrent request isn't stepped on.
+    $lock = $repo_path . '/.git/index.lock';
+    if ( is_file( $lock ) && ( time() - filemtime( $lock ) ) > 30 ) {
+        @unlink( $lock );
+    }
+
+    // Match the server's group-writable permission scheme (664/775) for any
+    // files/dirs git creates, instead of letting the process umask (644/755)
+    // silently strip group write access on every pull.
+    $old_umask = umask( 0002 );
     $out = [];
     $code = 0;
     exec( $cmd, $out, $code );
+    umask( $old_umask );
+
     return [ implode( "\n", $out ), $code ];
 }
 
@@ -156,7 +172,11 @@ add_action( 'wp_ajax_ggp_checkout', function () {
     $repo = ggp_repo_path();
     if ( ! is_dir( $repo . '/.git' ) ) wp_send_json_error( 'No .git folder found.' );
 
-    [ $out, $code ] = ggp_git( 'checkout ' . escapeshellarg( $target ) );
+    // This is a deploy target — local (server-side) modifications never win,
+    // so always force-discard them in favor of the target branch/commit.
+    // Untracked files can also block a checkout, so clean those first too.
+    ggp_git( 'clean -fd' );
+    [ $out, $code ] = ggp_git( 'checkout --force ' . escapeshellarg( $target ) );
     if ( $code !== 0 ) wp_send_json_error( $out );
 
     [ $new_branch, ] = ggp_git( 'rev-parse --abbrev-ref HEAD' );
@@ -507,7 +527,22 @@ function ggp_do_pull(): WP_Error|string {
         return new WP_Error( 'ggp_detached', 'Cannot pull in detached HEAD state — switch to a branch first.' );
     }
 
-    [ $output, $code ] = ggp_git( 'pull ' . escapeshellarg( $remote ) . ' ' . escapeshellarg( $branch ) );
+    // This is a deploy target — local (server-side) modifications never win.
+    // A merge-style `git pull` aborts if local changes would be overwritten,
+    // so fetch first and force the working tree to match the remote branch
+    // exactly instead.
+    [ $fetch_out, $fetch_code ] = ggp_git( 'fetch ' . escapeshellarg( $remote ) . ' ' . escapeshellarg( $branch ) );
+    if ( $fetch_code !== 0 ) {
+        $log   = get_option( GGP_LOG_KEY, [] );
+        $log[] = [ 'date' => current_time( 'Y-m-d H:i:s' ), 'success' => false, 'output' => $fetch_out ];
+        if ( count( $log ) > 20 ) $log = array_slice( $log, -20 );
+        update_option( GGP_LOG_KEY, $log );
+        return new WP_Error( 'ggp_fetch_failed', "Fetch exit {$fetch_code}:\n{$fetch_out}" );
+    }
+
+    // Untracked files can also block a hard reset, so clean those first too.
+    ggp_git( 'clean -fd' );
+    [ $output, $code ] = ggp_git( 'reset --hard ' . escapeshellarg( "{$remote}/{$branch}" ) );
 
     $success = ( $code === 0 );
     $log     = get_option( GGP_LOG_KEY, [] );
