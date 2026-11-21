@@ -3,7 +3,7 @@
  * Plugin Name: GitHub Git Pull
  * Plugin URI:  https://github.com
  * Description: Pull from GitHub and browse branches/commits from the WordPress admin.
- * Version:     2.0.0
+ * Version:     3.1.0
  * Author:      GitHub Git Pull
  * License:     GPL2
  */
@@ -12,7 +12,8 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'GGP_VERSION',      '3.0.0' );
+define( 'GGP_VERSION',      '3.1.0' );
+define( 'GGP_LOCK_TIMEOUT_EXIT', 75 );
 define( 'GGP_PLUGIN_URL',   plugin_dir_url( __FILE__ ) );
 define( 'GGP_OPTIONS_KEY',  'ggp_settings' );
 define( 'GGP_LOG_KEY',      'ggp_pull_log' );
@@ -54,7 +55,19 @@ function ggp_git( string $args, string $repo_path = '' ): array {
         ? 'GIT_SSH_COMMAND=' . escapeshellarg( "ssh -i {$ssh_key} -o StrictHostKeyChecking=no" ) . ' '
         : '';
     $ep  = escapeshellarg( $repo_path );
-    $cmd = "{$path_env}{$ssh_env}git -C {$ep} -c safe.directory={$ep} {$args} 2>&1";
+    $git = "git -C {$ep} -c safe.directory={$ep} {$args}";
+
+    // Serialize all git commands on this repo. The admin page fires a
+    // background `fetch --all` on load; if Pull is clicked before it finishes,
+    // two git processes race on .git/FETCH_HEAD and the remote refs, which
+    // fails with "divergent branches" or "cannot lock ref". flock makes each
+    // command wait (up to 60s) for the previous one instead.
+    $flock = ggp_flock_binary();
+    if ( $flock && is_dir( $repo_path . '/.git' ) ) {
+        $lockfile = escapeshellarg( $repo_path . '/.git/ggp.lock' );
+        $git      = "{$flock} -w 60 -E " . GGP_LOCK_TIMEOUT_EXIT . " {$lockfile} {$git}";
+    }
+    $cmd = "{$path_env}{$ssh_env}{$git} 2>&1";
 
     // A prior request that got killed mid-command (PHP timeout, worker
     // recycle, etc.) can leave this behind, which then blocks every
@@ -74,7 +87,23 @@ function ggp_git( string $args, string $repo_path = '' ): array {
     exec( $cmd, $out, $code );
     umask( $old_umask );
 
+    if ( $code === GGP_LOCK_TIMEOUT_EXIT ) {
+        $out[] = 'Another git operation on this repository is still running. Wait a few seconds and try again.';
+    }
+
     return [ implode( "\n", $out ), $code ];
+}
+
+/**
+ * Path to the flock binary (util-linux), or '' if it isn't available.
+ */
+function ggp_flock_binary(): string {
+    foreach ( [ '/usr/bin/flock', '/bin/flock' ] as $bin ) {
+        if ( is_executable( $bin ) ) {
+            return $bin;
+        }
+    }
+    return '';
 }
 
 /* ---------------------------------------------------------------
